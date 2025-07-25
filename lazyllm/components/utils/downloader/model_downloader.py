@@ -17,6 +17,38 @@ lazyllm.config.add('data_path', str, '', 'DATA_PATH')
 
 
 class ModelManager():
+    """ModelManager是LazyLLM为开发者提供的自动下载模型的工具类。目前支持从一个本地目录列表查找指定模型，以及从huggingface或者modelscope自动下载模型数据至指定目录。
+在使用ModelManager之前，需要设置下列环境变量：
+
+- LAZYLLM_MODEL_SOURCE: 模型下载源，可以设置为 ``huggingface`` 或 ``modelscope`` 。
+- LAZYLLM_MODEL_SOURCE_TOKEN: ``huggingface`` 或 ``modelscope`` 提供的token，用于下载私有模型。
+- LAZYLLM_MODEL_PATH: 冒号 ``:`` 分隔的本地绝对路径列表用于搜索模型。
+- LAZYLLM_MODEL_CACHE_DIR: 下载后的模型在本地的存储目录
+
+Keyword Args: 
+    model_source (str, 可选): 模型下载源，目前仅支持 ``huggingface`` 或 ``modelscope`` 。如有必要，ModelManager将从此下载源下载模型数据。如果不提供，默认使用
+        LAZYLLM_MODEL_SOURCE环境变量中的设置。如未设置LAZYLLM_MODEL_SOURCE，ModelManager将从 ``modelscope`` 下载模型。
+    token (str, 可选): ``huggingface`` 或 ``modelscope`` 提供的token。如果token不为空，ModelManager将使用此token下载模型数据。如果不提供，默认使用
+        LAZYLLM_MODEL_SOURCE_TOKEN环境变量中的设置。如未设置LAZYLLM_MODEL_SOURCE_TOKEN，ModelManager将不会自动下载私有模型。
+    model_path (str, 可选)：冒号(:)分隔的本地绝对路径列表。在实际下载模型数据之前，ModelManager将在此列表包含的目录中尝试寻找目标模型。如果不提供，默认使用
+        LAZYLLM_MODEL_PATH环境变量中的设置。如果为空或LAZYLLM_MODEL_PATH未设置，ModelManager将跳过从model_path中寻找模型的步骤。
+    cache_dir (str, 可选): 一个本地目录的绝对路径。下载后的模型将存放在此目录下，如果不提供，默认使用LAZYLLM_MODEL_CACHE_DIR环境变量中的设置。如果
+        LAZYLLM_MODEL_PATH未设置，默认值为~/.lazyllm/model
+ModelManager.download(model) -> str
+
+用于从model_source下载模型。download函数首先在ModelManager类初始化参数model_path列出的目录中搜索目标模型。如果未找到，会在cache_dir下搜索目标模型。如果仍未找到，
+则从model_source上下载模型并存放于cache_dir下。
+
+Args:
+    model (str): 目标模型名称。download函数使用此名称从model_source上下载模型。为了方便开发者使用，LazyLLM为常用模型建立了简略模型名称到下载源实际模型名称的映射，
+        例如 ``Llama-3-8B`` , ``GLM3-6B`` 或 ``Qwen1.5-7B`` 。具体可参考文件 ``lazyllm/module/utils/downloader/model_mapping.py`` 。model可以接受简略模型名或下载源中的模型全名。
+
+
+Examples:
+    >>> from lazyllm.components import ModelManager
+    >>> downloader = ModelManager(model_source='modelscope')
+    >>> downloader.download('chatglm3-6b')
+    """
     def __init__(self, model_source, token=lazyllm.config['model_source_token'],
                  cache_dir=lazyllm.config['model_cache_dir'], model_path=lazyllm.config['model_path']):
         self.model_source = model_source or lazyllm.config['model_source']
@@ -24,16 +56,16 @@ class ModelManager():
         self.cache_dir = cache_dir
         self.model_paths = model_path.split(":") if len(model_path) > 0 else []
         if self.model_source == 'huggingface':
-            self.hub_downloader = HuggingfaceDownloader(token=self.token)
+            self.hub_downloader = _HuggingfaceDownloader(token=self.token)
         else:
-            self.hub_downloader = ModelscopeDownloader(token=self.token)
+            self.hub_downloader = _ModelscopeDownloader(token=self.token)
             if self.model_source != 'modelscope':
                 lazyllm.LOG.error("Only support Huggingface and Modelscope currently. "
                                   f"Unsupported model source: {self.model_source}. Forcing use of Modelscope.")
 
     @staticmethod
     @functools.lru_cache
-    def get_model_type(model) -> str:
+    def _get_model_type(model) -> str:
         assert isinstance(model, str) and len(model) > 0, f'model name should be a non-empty string, get {model}'
         __class__._try_add_mapping(model)
         for name, info in model_name_mapping.items():
@@ -49,7 +81,7 @@ class ModelManager():
 
     @staticmethod
     @functools.lru_cache
-    def get_model_name(model) -> str:
+    def _get_model_name(model) -> str:
         search_string = os.path.basename(model)
         __class__._try_add_mapping(search_string)
         for model_name, sources in model_name_mapping.items():
@@ -61,8 +93,8 @@ class ModelManager():
 
     @staticmethod
     @functools.lru_cache
-    def get_model_prompt_keys(model) -> dict:
-        model_name = __class__.get_model_name(model)
+    def _get_model_prompt_keys(model) -> dict:
+        model_name = __class__._get_model_name(model)
         __class__._try_add_mapping(model_name)
         if model_name and "prompt_keys" in model_name_mapping[model_name.lower()]:
             return model_name_mapping[model_name.lower()]["prompt_keys"]
@@ -70,7 +102,7 @@ class ModelManager():
             return dict()
 
     @staticmethod
-    def validate_model_path(model_path):
+    def _validate_model_path(model_path):
         extensions = {'.pt', '.bin', '.safetensors'}
         for _, _, files in os.walk(model_path):
             for file in files:
@@ -132,10 +164,10 @@ class ModelManager():
             model_save_dir = self._do_download(model_name_for_download, call_back)
             return model_save_dir
 
-    def validate_token(self):
+    def _validate_token(self):
         return self.hub_downloader.verify_hub_token()
 
-    def validate_model_id(self, model_id):
+    def _validate_model_id(self, model_id):
         return self.hub_downloader.verify_model_id(model_id)
 
     def _model_exists_at_path(self, model_name):
@@ -171,7 +203,7 @@ class ModelManager():
         full_model_dir = os.path.join(self.cache_dir, self.model_source, model_dir)
 
         try:
-            return self.hub_downloader.download(model, full_model_dir, call_back)
+            return self.hub_downloader._download(model, full_model_dir, call_back)
         # Use `BaseException` to capture `KeyboardInterrupt` and normal `Exceptioin`.
         except BaseException as e:
             lazyllm.LOG.warning(f"Download encountered an error: {e}")
@@ -184,7 +216,7 @@ class ModelManager():
                 lazyllm.LOG.warning(f"{full_model_dir} removed due to exceptions.")
         return False
 
-class HubDownloader(ABC):
+class _HubDownloader(ABC):
 
     def __init__(self, token=None):
         self._token = token if self._verify_hub_token(token) else None
@@ -199,7 +231,7 @@ class HubDownloader(ABC):
         pass
 
     @abstractmethod
-    def verify_model_id(self, model_id):
+    def _verify_model_id(self, model_id):
         pass
 
     @abstractmethod
@@ -236,7 +268,7 @@ class HubDownloader(ABC):
             size += item['Size']
         return size
 
-    def download(self, model_id, model_dir, call_back=None):
+    def _download(self, model_id, model_dir, call_back=None):
         total = self._get_files_total_size(self._get_repo_files(model_id))
         if call_back:
             polling_event = threading.Event()
@@ -250,10 +282,11 @@ class HubDownloader(ABC):
             polling_thread.join()
         return downloaded_path
 
+    # 判断是否设置huggingface token
     def verify_hub_token(self):
         return True if self._token else False
 
-class HuggingfaceDownloader(HubDownloader):
+class _HuggingfaceDownloader(_HubDownloader):
 
     def _build_hub_api(self, token):
         from huggingface_hub import HfApi
@@ -300,7 +333,7 @@ class HuggingfaceDownloader(HubDownloader):
                 })
         return hub_model_info
 
-class ModelscopeDownloader(HubDownloader):
+class _ModelscopeDownloader(_HubDownloader):
 
     def _build_hub_api(self, token):
         from modelscope.hub.api import HubApi
